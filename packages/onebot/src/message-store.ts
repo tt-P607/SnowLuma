@@ -1,6 +1,8 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { createLogger } from '@snowluma/common/logger';
 import type { JsonObject, MessageMeta } from './types';
+import type { MessageElement } from '@snowluma/protocol/events';
+import { cqUnescape } from './helper/cq';
 import { openSqliteDb } from './sqlite-open';
 import {
   createMessageStoreIndexes,
@@ -191,11 +193,9 @@ export class MessageStore {
     );
 
     this.stmtFindPrivateMessageAtTime = this.db.prepare(
-      `SELECT message_hash
+      `SELECT message_hash, data
        FROM messages
-       WHERE is_group = 0 AND session_id = ? AND private_direction = ? AND timestamp = ?
-       ORDER BY sequence DESC
-       LIMIT 1`,
+       WHERE is_group = 0 AND session_id = ? AND private_direction = ? AND timestamp = ?`,
     );
 
     this.stmtFindPrivateMessageBySequence = this.db.prepare(
@@ -514,6 +514,7 @@ export class MessageStore {
     replySequence: number,
     sentBySelf: boolean,
     timestamp?: number,
+    replyElements?: readonly MessageElement[],
   ): number | null {
     if (Number.isSafeInteger(replySequence) && replySequence > 0) {
       const byClientSequence = this.findPrivateMessageId(
@@ -531,7 +532,7 @@ export class MessageStore {
       if (byConversationSequence !== null) return byConversationSequence;
     }
     if (!sentBySelf) return null;
-    const byExactTime = this.findPrivateMessageIdAtTime(sessionId, true, timestamp);
+    const byExactTime = this.findPrivateMessageIdAtTime(sessionId, true, timestamp, replyElements);
     if (byExactTime !== null) return byExactTime;
     const byNearbyTime = this.findUniquePrivateOutgoingNearTime(sessionId, timestamp);
     if (byNearbyTime !== null) return byNearbyTime;
@@ -542,15 +543,32 @@ export class MessageStore {
     sessionId: number,
     sentBySelf: boolean,
     timestamp?: number,
+    replyElements?: readonly MessageElement[],
   ): number | null {
     if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return null;
     if (!isUsablePrivateQuoteTime(timestamp)) return null;
-    const row = this.stmtFindPrivateMessageAtTime.get(
+    const rows = this.stmtFindPrivateMessageAtTime.all(
       sessionId,
       sentBySelf ? 1 : 0,
       timestamp,
-    ) as { message_hash: number } | undefined;
-    if (!row) return null;
+    ) as { message_hash: number; data: string | null }[];
+    if (rows.length === 0) return null;
+    let matches = rows;
+    if (rows.length > 1) {
+      const text = replyElements?.length && replyElements.every(e => e.type === 'text')
+        ? replyElements.map(e => e.text ?? '').join('')
+        : null;
+      const candidates = text ? rows.map(row => ({ row, preview: cachedQuoteText(row.data) }))
+        .filter(({ preview }) => preview === null || preview.text.startsWith(text)) : [];
+      matches = candidates.length === 1 && candidates[0]!.preview?.plain
+        && candidates[0]!.preview.text === text ? [candidates[0]!.row] : [];
+      if (matches.length !== 1) {
+        log.debug('private quote time is ambiguous: peer=%d time=%d candidates=%d contentMatches=%d',
+          sessionId, timestamp, rows.length, matches.length);
+        return null;
+      }
+    }
+    const row = matches[0]!;
     if (!isValidMessageId(row.message_hash)) {
       throw new Error(`private message lookup matched invalid message id ${String(row.message_hash)}`);
     }
@@ -821,6 +839,32 @@ function eventPrivateDirection(isGroup: boolean, event: JsonObject): number {
 }
 
 const PRIVATE_REPLY_TIME_WINDOWS_SECONDS = [5, 30] as const;
+
+/** Unknown, truncated, and media previews remain possible competing matches. */
+function cachedQuoteText(data: string | null): { text: string; plain: boolean } | null {
+  if (!data) return null;
+  const event = JSON.parse(data) as JsonObject;
+  if (typeof event.message === 'string') {
+    return event.message.includes('[CQ:') ? null : { text: cqUnescape(event.message), plain: true };
+  }
+  if (!Array.isArray(event.message) || event.message.length === 0) return null;
+  const segments = event.message as JsonObject[];
+  const labels: Record<string, string> = {
+    image: '[图片]', record: '[语音]', video: '[视频]', file: '[文件]',
+    face: '[表情]', mface: '[表情]', forward: '[聊天记录]', json: '[卡片]', xml: '[卡片]',
+  };
+  const parts: string[] = [];
+  let plain = true;
+  for (const segment of segments) {
+    const body = segment?.data as JsonObject | undefined;
+    if (segment?.type === 'text' && typeof body?.text === 'string') parts.push(body.text);
+    else if (typeof segment?.type === 'string' && labels[segment.type]) {
+      parts.push(typeof body?.summary === 'string' ? body.summary : labels[segment.type]!);
+      plain = false;
+    } else return null;
+  }
+  return { text: parts.join(''), plain };
+}
 
 function isUsablePrivateQuoteTime(timestamp: number | undefined): timestamp is number {
   return timestamp !== undefined
